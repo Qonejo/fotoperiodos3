@@ -725,7 +725,7 @@ lv_obj_t *soilBar1 = nullptr;
 lv_obj_t *soilBar2 = nullptr;
 static bool progressDragging = false;
 // Evita que los eventos PRESSING repetidos sumen más de un día cuando el
-// usuario mantiene el dedo al final de la barra durante la fase oscura.
+// usuario mantiene el dedo al final de la barra durante un ciclo completo.
 static bool progressCompletedCycleThisTouch = false;
 
 lv_obj_t *connectionDotMain = nullptr;
@@ -1707,10 +1707,13 @@ static void updateProgressFromTouch() {
 
     double lightSecs = lightHours * 3600.0;
     double darkSecs  = darkHours * 3600.0;
-    // La barra representa la fase actual. Al completar OSCURIDAD, sí termina
-    // el ciclo LUZ + OSCURIDAD: se acredita exactamente un día a la etapa
-    // activa y la barra vuelve al comienzo de LUZ.
-    if (!inLightMode && ratio >= 1.0f) {
+    double totalSecs = lightSecs + darkSecs;
+    if (totalSecs <= 0.0) return;
+
+    // La barra siempre representa el ciclo completo LUZ + OSCURIDAD. Al
+    // alcanzar el 99 % se acredita un único día y se inicia el ciclo siguiente.
+    // El umbral evita que la precisión del touch impida alcanzar el último píxel.
+    if (ratio >= 0.99f) {
         if (!progressCompletedCycleThisTouch) {
             addCompletedCycles(1);
             progressCompletedCycleThisTouch = true;
@@ -1722,19 +1725,11 @@ static void updateProgressFromTouch() {
         return;
     }
 
-    if (inLightMode) {
-        photoSecondsElapsed = ratio * lightSecs;
-    } else {
-        photoSecondsElapsed = lightSecs + ratio * darkSecs;
-    }
-
-    double totalSecs = lightSecs + darkSecs;
-    if (totalSecs > 0.0) {
-        photoSecondsElapsed = constrain(photoSecondsElapsed, 0.0, totalSecs - 0.001);
-    }
+    photoSecondsElapsed = ratio * totalSecs;
 
     inLightMode = photoSecondsElapsed < lightSecs;
     relay1Command = inLightMode;
+    sendControl();
 
     markChanged();
 }
@@ -2147,23 +2142,25 @@ static void updateMainUI() {
 
     double lightSecs = lightHours * 3600.0;
     double darkSecs = darkHours * 3600.0;
+    double totalSecs = lightSecs + darkSecs;
     double phaseDur = inLightMode ? lightSecs : darkSecs;
     double phaseElapsed = inLightMode ? photoSecondsElapsed : photoSecondsElapsed - lightSecs;
 
+    if (totalSecs < 1.0) totalSecs = 1.0;
     if (phaseDur < 1.0) phaseDur = 1.0;
     phaseElapsed = constrain(phaseElapsed, 0.0, phaseDur);
 
-    int phasePercent = (int)((phaseElapsed / phaseDur) * 100.0);
-    phasePercent = constrain(phasePercent, 0, 100);
+    int cyclePercent = (int)((photoSecondsElapsed / totalSecs) * 100.0);
+    cyclePercent = constrain(cyclePercent, 0, 100);
 
-    if (lastPercent != phasePercent || lastPhase != inLightMode) {
-        lv_bar_set_value(progressBar, phasePercent, LV_ANIM_OFF);
+    if (lastPercent != cyclePercent || lastPhase != inLightMode) {
+        lv_bar_set_value(progressBar, cyclePercent, LV_ANIM_OFF);
         lv_obj_set_style_bg_color(progressBar, isVegetative ? C_GREEN : C_AMBER, LV_PART_INDICATOR);
 
         snprintf(buf, sizeof(buf), "FASE: %s", inLightMode ? "LUZ" : "OSC");
         lv_label_set_text(labelPhase, buf);
 
-        lastPercent = phasePercent;
+        lastPercent = cyclePercent;
         lastPhase = inLightMode;
     }
 
@@ -2180,7 +2177,7 @@ static void updateMainUI() {
         snprintf(buf, sizeof(buf), "%02d:%02d:%02d", rh, rm, rs);
         lv_label_set_text(labelRemaining, buf);
 
-        snprintf(buf, sizeof(buf), "%d%%", phasePercent);
+        snprintf(buf, sizeof(buf), "%d%%", cyclePercent);
         lv_label_set_text(labelPercent, buf);
 
         updateClockUI();
