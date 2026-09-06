@@ -724,6 +724,9 @@ lv_obj_t *labelSoil2 = nullptr;
 lv_obj_t *soilBar1 = nullptr;
 lv_obj_t *soilBar2 = nullptr;
 static bool progressDragging = false;
+// Evita que los eventos PRESSING repetidos sumen más de un día cuando el
+// usuario mantiene el dedo al final de la barra durante la fase oscura.
+static bool progressCompletedCycleThisTouch = false;
 
 lv_obj_t *connectionDotMain = nullptr;
 lv_obj_t *connectionDotC3 = nullptr;
@@ -1126,33 +1129,6 @@ static void sendControl() {
 
 static void markChanged();
 
-static double getCycleSecondsRTC() {
-    if (!rtcAnchored || !rtcReady) {
-        return photoSecondsElapsed;
-    }
-
-    time_t now = getRtcEpoch();
-
-    double elapsed =
-        difftime(
-            now,
-            cycleStartEpoch
-        );
-
-    double total =
-        (lightHours + darkHours) * 3600.0;
-
-    if (elapsed < 0) {
-        elapsed = 0;
-    }
-
-    if (total > 0) {
-        elapsed = fmod(elapsed, total);
-    }
-
-    return elapsed;
-}
-
 // Los contadores son independientes de la UI: sólo se modifican cuando
 // termina uno o más ciclos completos de LUZ + OSCURIDAD.
 static void addCompletedCycles(unsigned long completedCycles) {
@@ -1193,40 +1169,12 @@ static void updatePhotoperiod() {
     double lightSecs = lightHours * 3600.0;
     if (totalSecs <= 0.0) return;
 
-    // Ruta 1: sincronización/anclaje con RTC. El epoch guardado representa
-    // el inicio del ciclo actual, por lo que también contabiliza el tiempo
-    // transcurrido con el equipo apagado una sola vez.
-    if (rtcReady && !rtcAnchored) {
-        time_t epoch = getRtcEpoch();
-        if (epoch >= VALID_EPOCH && !rtcNeedsNtpSync) {
-            if (cycleStartEpoch > 0 && epoch >= cycleStartEpoch) {
-                double elapsed = difftime(epoch, cycleStartEpoch);
-                elapsed = consumeCompletedCycles(elapsed, totalSecs);
-                cycleStartEpoch = epoch - (time_t)elapsed;
-                photoSecondsElapsed = elapsed;
-            } else {
-                cycleStartEpoch = epoch - (time_t)photoSecondsElapsed;
-            }
-            rtcAnchored = true;
-        }
-    }
-
-    // Ruta 2: avance normal anclado al RTC.
-    if (rtcReady && rtcAnchored) {
-        time_t epoch = getRtcEpoch();
-        double elapsed = difftime(epoch, cycleStartEpoch);
-        if (elapsed < 0.0) elapsed = 0.0;
-
-        elapsed = consumeCompletedCycles(elapsed, totalSecs);
-        cycleStartEpoch = epoch - (time_t)elapsed;
-        photoSecondsElapsed = elapsed;
-    } else {
-        // Ruta 3: avance sin RTC. Conserva el resto del ciclo si el bucle se
-        // retrasó, y suma exactamente todos los ciclos completos transcurridos.
-        photoSecondsElapsed += delta;
-        photoSecondsElapsed =
-            consumeCompletedCycles(photoSecondsElapsed, totalSecs);
-    }
+    // El fotoperiodo usa solamente millis(): la cuenta no depende del RTC.
+    // Conserva el resto del ciclo si el bucle se retrasó y acredita todos los
+    // ciclos completos, incluso si se sobrepasa más de uno entre iteraciones.
+    photoSecondsElapsed += delta;
+    photoSecondsElapsed =
+        consumeCompletedCycles(photoSecondsElapsed, totalSecs);
 
     bool newLight = photoSecondsElapsed < lightSecs;
     if (newLight != inLightMode) {
@@ -1646,6 +1594,16 @@ static void onStage(
 
     relay1Command = true;
     sendControl();
+
+    // Actualizarlo en el mismo toque evita depender del siguiente refresco de
+    // la UI y confirma de inmediato que el botón cambió de etapa.
+    if (labelStage) {
+        lv_label_set_text(labelStage, isVegetative ? "VEGETACION" : "FLORACION");
+        lv_obj_set_style_text_color(labelStage, C_BG, 0);
+    }
+    lv_obj_set_style_bg_color(btnStage, isVegetative ? C_GREEN : C_AMBER, 0);
+    lv_obj_set_style_text_color(btnStage, C_BG, 0);
+
     updateFace();
     markChanged();
 }
@@ -1656,10 +1614,16 @@ static void onSkipPhase(
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 
     if (inLightMode) {
-        photoSecondsElapsed =
-            lightHours * 3600.0 + 1.0;
+        // Termina solamente la fase de luz; el día se acredita al terminar
+        // también la fase de oscuridad.
+        photoSecondsElapsed = lightHours * 3600.0;
+        inLightMode = false;
     } else {
+        // LUZ + OSCURIDAD completadas: este es el único punto en el que se
+        // suma un día al contador de la etapa activa.
+        addCompletedCycles(1);
         photoSecondsElapsed = 0.0;
+        inLightMode = true;
     }
 
     if (rtcAnchored) {
@@ -1667,10 +1631,6 @@ static void onSkipPhase(
             getRtcEpoch() -
             (time_t)photoSecondsElapsed;
     }
-
-    inLightMode =
-        photoSecondsElapsed <
-        lightHours * 3600.0;
 
     relay1Command = inLightMode;
 
@@ -1739,35 +1699,38 @@ static void updateProgressFromTouch() {
     int width = lv_area_get_width(&area);
     if (width <= 0) return;
 
-    float ratio = (float)(point.x - area.x1) / (float)width;
+    // lv_area_get_width() cuenta ambos extremos. Usar width - 1 permite que
+    // el último píxel de la barra alcance exactamente 100 %.
+    int usableWidth = max(1, width - 1);
+    float ratio = (float)(point.x - area.x1) / (float)usableWidth;
     ratio = constrain(ratio, 0.0f, 1.0f);
 
     double lightSecs = lightHours * 3600.0;
     double darkSecs  = darkHours * 3600.0;
-    double phaseDur  = inLightMode ? lightSecs : darkSecs;
-    if (phaseDur < 1.0) phaseDur = 1.0;
-
-    // La barra siempre representa la fase que se está viendo.
-    // No se cambia el ciclo completo ni los días.
-    if (inLightMode) {
-        photoSecondsElapsed = ratio * lightSecs;
-    } else {
-        photoSecondsElapsed = lightSecs + ratio * darkSecs;
-    }
-
     double totalSecs = lightSecs + darkSecs;
-    if (totalSecs > 0.0) {
-        photoSecondsElapsed = constrain(photoSecondsElapsed, 0.0, totalSecs - 0.001);
+    if (totalSecs <= 0.0) return;
+
+    // La barra muestra el ciclo completo, no sólo la fase actual. Así no se
+    // reinicia al pasar de LUZ a OSC y sólo llega al final cuando corresponde
+    // acreditar un día completo.
+    constexpr float PROGRESS_END_RATIO = 0.99f;
+    if (ratio >= PROGRESS_END_RATIO) {
+        if (!progressCompletedCycleThisTouch) {
+            addCompletedCycles(1);
+            progressCompletedCycleThisTouch = true;
+            photoSecondsElapsed = 0.0;
+            inLightMode = true;
+            relay1Command = true;
+            sendControl();
+        }
+        return;
     }
+
+    photoSecondsElapsed = ratio * totalSecs;
+    photoSecondsElapsed = constrain(photoSecondsElapsed, 0.0, totalSecs - 0.001);
 
     inLightMode = photoSecondsElapsed < lightSecs;
     relay1Command = inLightMode;
-
-    // Anclamos inmediatamente el punto seleccionado al reloj simulado.
-    if (rtcReady) {
-        cycleStartEpoch = getRtcEpoch() - (time_t)photoSecondsElapsed;
-        rtcAnchored = true;
-    }
 
     markChanged();
 }
@@ -1776,14 +1739,18 @@ static void onProgressTouch(lv_event_t *e) {
     lv_event_code_t code = lv_event_get_code(e);
 
     if (code == LV_EVENT_PRESSED || code == LV_EVENT_PRESSING) {
+        if (code == LV_EVENT_PRESSED) {
+            progressCompletedCycleThisTouch = false;
+        }
+        if (progressCompletedCycleThisTouch) return;
         progressDragging = true;
         updateProgressFromTouch();
         return;
     }
 
     if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
-        updateProgressFromTouch();
         progressDragging = false;
+        progressCompletedCycleThisTouch = false;
         return;
     }
 }
@@ -1837,6 +1804,10 @@ static void createMainUI() {
     makeLabelAt(screenMain, "MODO:", &lv_font_montserrat_12, C_WHITE, 5, 77);
 
     btnStage = makeButton(screenMain, "VEGETACION", 50, 74, 110, 22);
+    labelStage = lv_obj_get_child(btnStage, 0);
+    lv_obj_set_style_bg_color(btnStage, C_GREEN, 0);
+    lv_obj_set_style_text_color(btnStage, C_BG, 0);
+    lv_obj_set_style_text_color(labelStage, C_BG, 0);
     lv_obj_add_event_cb(btnStage, onStage, LV_EVENT_CLICKED, nullptr);
 
     // --------------------------------------------------------
@@ -1856,14 +1827,15 @@ static void createMainUI() {
     lv_obj_add_event_cb(btnVegMinus, onVegMinus, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(btnVegPlus, onVegPlus, LV_EVENT_CLICKED, nullptr);
 
-    makeLabelAt(screenMain, "DIAS FLOR:", &lv_font_montserrat_12, C_WHITE, 5, 128);
+    // Cinco píxeles adicionales de separación respecto a DÍAS VEG.
+    makeLabelAt(screenMain, "DIAS FLOR:", &lv_font_montserrat_12, C_WHITE, 5, 133);
 
-    btnFlowerMinus = makeButton(screenMain, "<", 82, 124, 20, 20);
+    btnFlowerMinus = makeButton(screenMain, "<", 82, 129, 20, 20);
 
     labelDaysFlower = makeLabel(screenMain, "0", &lv_font_montserrat_18, C_AMBER);
-    lv_obj_set_pos(labelDaysFlower, 108, 124);
+    lv_obj_set_pos(labelDaysFlower, 108, 129);
 
-    btnFlowerPlus = makeButton(screenMain, ">", 132, 124, 20, 20);
+    btnFlowerPlus = makeButton(screenMain, ">", 132, 129, 20, 20);
 
     lv_obj_add_event_cb(btnFlowerMinus, onFlowerMinus, LV_EVENT_CLICKED, nullptr);
     lv_obj_add_event_cb(btnFlowerPlus, onFlowerPlus, LV_EVENT_CLICKED, nullptr);
@@ -1872,7 +1844,7 @@ static void createMainUI() {
     // BARRA DE TIEMPO TOUCH
     // --------------------------------------------------------
     progressBar = lv_bar_create(screenMain);
-    lv_obj_set_pos(progressBar, 5, 154);
+    lv_obj_set_pos(progressBar, 5, 159);
     lv_obj_set_size(progressBar, 225, 13);
     lv_obj_clear_flag(progressBar, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(progressBar, LV_OBJ_FLAG_CLICKABLE);
@@ -1888,13 +1860,13 @@ static void createMainUI() {
     lv_obj_add_event_cb(progressBar, onProgressTouch, LV_EVENT_PRESS_LOST, nullptr);
 
     labelPhase = makeLabel(screenMain, "FASE: LUZ", &lv_font_montserrat_12, C_GREEN);
-    lv_obj_set_pos(labelPhase, 5, 174);
+    lv_obj_set_pos(labelPhase, 5, 179);
 
     labelRemaining = makeLabel(screenMain, "00:00:00", &lv_font_montserrat_12, C_WHITE);
-    lv_obj_set_pos(labelRemaining, 70, 174);
+    lv_obj_set_pos(labelRemaining, 70, 179);
 
     labelPercent = makeLabel(screenMain, "0%", &lv_font_montserrat_12, C_AMBER);
-    lv_obj_set_pos(labelPercent, 165, 174);
+    lv_obj_set_pos(labelPercent, 165, 179);
 
     // --------------------------------------------------------
     // S1 / S2: COLUMNAS VERTICALES INFERIORES
@@ -1908,13 +1880,13 @@ static void createMainUI() {
     // S1/S2 quedan centrados abajo de cada columna.
 
     labelSoil1 = makeLabel(screenMain, "0%", &lv_font_montserrat_10, C_GREEN);
-    lv_obj_set_pos(labelSoil1, 40, 190);
+    lv_obj_set_pos(labelSoil1, 40, 195);
     lv_obj_set_width(labelSoil1, 20);
     lv_label_set_long_mode(labelSoil1, LV_LABEL_LONG_CLIP);
     lv_obj_set_style_text_align(labelSoil1, LV_TEXT_ALIGN_CENTER, 0);
 
     soilBar1 = lv_bar_create(screenMain);
-    lv_obj_set_pos(soilBar1, 40, 204);
+    lv_obj_set_pos(soilBar1, 40, 209);
     lv_obj_set_size(soilBar1, 20, 82);
     lv_bar_set_range(soilBar1, 0, 100);
     lv_bar_set_value(soilBar1, 0, LV_ANIM_OFF);
@@ -1924,13 +1896,13 @@ static void createMainUI() {
     lv_obj_set_style_border_width(soilBar1, 1, LV_PART_MAIN);
 
     labelSoil2 = makeLabel(screenMain, "0%", &lv_font_montserrat_10, C_BLUE);
-    lv_obj_set_pos(labelSoil2, 80, 190);
+    lv_obj_set_pos(labelSoil2, 80, 195);
     lv_obj_set_width(labelSoil2, 20);
     lv_label_set_long_mode(labelSoil2, LV_LABEL_LONG_CLIP);
     lv_obj_set_style_text_align(labelSoil2, LV_TEXT_ALIGN_CENTER, 0);
 
     soilBar2 = lv_bar_create(screenMain);
-    lv_obj_set_pos(soilBar2, 80, 204);
+    lv_obj_set_pos(soilBar2, 80, 209);
     lv_obj_set_size(soilBar2, 20, 82);
     lv_bar_set_range(soilBar2, 0, 100);
     lv_bar_set_value(soilBar2, 0, LV_ANIM_OFF);
@@ -1939,8 +1911,8 @@ static void createMainUI() {
     lv_obj_set_style_border_color(soilBar2, C_WHITE, LV_PART_MAIN);
     lv_obj_set_style_border_width(soilBar2, 1, LV_PART_MAIN);
 
-    makeLabelAt(screenMain, "S1", &lv_font_montserrat_10, C_GREEN, 40, 289);
-    makeLabelAt(screenMain, "S2", &lv_font_montserrat_10, C_BLUE, 80, 289);
+    makeLabelAt(screenMain, "S1", &lv_font_montserrat_10, C_GREEN, 40, 294);
+    makeLabelAt(screenMain, "S2", &lv_font_montserrat_10, C_BLUE, 80, 294);
 
     // --------------------------------------------------------
     // CARITA: al fondo, centrada y sin redibujado periódico.
@@ -2160,11 +2132,12 @@ static void updateMainUI() {
     }
 
     if (lastStage != isVegetative) {
-        // El texto vive dentro del botón; no existe un labelStage separado.
-        lv_obj_t *btnLabel = lv_obj_get_child(btnStage, 0);
-        if (btnLabel) {
-            lv_label_set_text(btnLabel, isVegetative ? "VEGETACION" : "FLORACION");
+        if (labelStage) {
+            lv_label_set_text(labelStage, isVegetative ? "VEGETACION" : "FLORACION");
+            lv_obj_set_style_text_color(labelStage, C_BG, 0);
         }
+        lv_obj_set_style_bg_color(btnStage, isVegetative ? C_GREEN : C_AMBER, 0);
+        lv_obj_set_style_text_color(btnStage, C_BG, 0);
         lastStage = isVegetative;
     }
 
@@ -2176,17 +2149,23 @@ static void updateMainUI() {
     if (phaseDur < 1.0) phaseDur = 1.0;
     phaseElapsed = constrain(phaseElapsed, 0.0, phaseDur);
 
-    int phasePercent = (int)((phaseElapsed / phaseDur) * 100.0);
-    phasePercent = constrain(phasePercent, 0, 100);
+    double cycleSecs = lightSecs + darkSecs;
+    int cyclePercent = 0;
+    if (cycleSecs > 0.0) {
+        cyclePercent = (int)((photoSecondsElapsed / cycleSecs) * 100.0);
+    }
+    cyclePercent = constrain(cyclePercent, 0, 100);
 
-    if (lastPercent != phasePercent || lastPhase != inLightMode) {
-        lv_bar_set_value(progressBar, phasePercent, LV_ANIM_OFF);
+    if (lastPercent != cyclePercent || lastPhase != inLightMode) {
+        // La carga representa LUZ + OSC. Por eso no vuelve a cero al cambiar
+        // de fase y llega al 100 % sólo al completar un día.
+        lv_bar_set_value(progressBar, cyclePercent, LV_ANIM_OFF);
         lv_obj_set_style_bg_color(progressBar, isVegetative ? C_GREEN : C_AMBER, LV_PART_INDICATOR);
 
         snprintf(buf, sizeof(buf), "FASE: %s", inLightMode ? "LUZ" : "OSC");
         lv_label_set_text(labelPhase, buf);
 
-        lastPercent = phasePercent;
+        lastPercent = cyclePercent;
         lastPhase = inLightMode;
     }
 
@@ -2203,7 +2182,7 @@ static void updateMainUI() {
         snprintf(buf, sizeof(buf), "%02d:%02d:%02d", rh, rm, rs);
         lv_label_set_text(labelRemaining, buf);
 
-        snprintf(buf, sizeof(buf), "%d%%", phasePercent);
+        snprintf(buf, sizeof(buf), "%d%%", cyclePercent);
         lv_label_set_text(labelPercent, buf);
 
         updateClockUI();
@@ -2362,4 +2341,3 @@ void loop() {
 
     delay(2);
 }
-
