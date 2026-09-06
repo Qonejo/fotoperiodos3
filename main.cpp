@@ -1614,10 +1614,16 @@ static void onSkipPhase(
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 
     if (inLightMode) {
-        photoSecondsElapsed =
-            lightHours * 3600.0 + 1.0;
+        // Termina solamente la fase de luz; el día se acredita al terminar
+        // también la fase de oscuridad.
+        photoSecondsElapsed = lightHours * 3600.0;
+        inLightMode = false;
     } else {
+        // LUZ + OSCURIDAD completadas: este es el único punto en el que se
+        // suma un día al contador de la etapa activa.
+        addCompletedCycles(1);
         photoSecondsElapsed = 0.0;
+        inLightMode = true;
     }
 
     if (rtcAnchored) {
@@ -1625,10 +1631,6 @@ static void onSkipPhase(
             getRtcEpoch() -
             (time_t)photoSecondsElapsed;
     }
-
-    inLightMode =
-        photoSecondsElapsed <
-        lightHours * 3600.0;
 
     relay1Command = inLightMode;
 
@@ -1697,7 +1699,10 @@ static void updateProgressFromTouch() {
     int width = lv_area_get_width(&area);
     if (width <= 0) return;
 
-    float ratio = (float)(point.x - area.x1) / (float)width;
+    // lv_area_get_width() cuenta ambos extremos. Usar width - 1 permite que
+    // el último píxel de la barra alcance exactamente 100 %.
+    int usableWidth = max(1, width - 1);
+    float ratio = (float)(point.x - area.x1) / (float)usableWidth;
     ratio = constrain(ratio, 0.0f, 1.0f);
 
     double lightSecs = lightHours * 3600.0;
