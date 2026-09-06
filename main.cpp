@@ -40,6 +40,8 @@
 #include "lvgl_v8_port.h"
 
 #include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
 #include <time.h>
 #include <math.h>
 #include <pgmspace.h>
@@ -825,28 +827,121 @@ static lv_color_t vpdColor(float vpd) {
 // ============================================================
 
 static void deselectSpiDevices() {
-    // Sin SD en modo prueba.
+    pinMode(SD_CS, OUTPUT);
+    digitalWrite(SD_CS, HIGH);
 }
 
 static bool initSdCard() {
-    sdReady = false;
-    Serial.println("[SD] modo prueba: omitida");
-    return false;
+    deselectSpiDevices();
+    SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+    sdReady = SD.begin(SD_CS, SPI);
+
+    Serial.printf("[SD] %s\n", sdReady ? "lista" : "no disponible");
+    return sdReady;
 }
 
 static String readFile(const char *path) {
-    (void)path;
-    return "";
+    if (!sdReady) return "";
+
+    File file = SD.open(path, FILE_READ);
+    if (!file) return "";
+
+    String content;
+    while (file.available()) {
+        content += (char)file.read();
+    }
+    file.close();
+    return content;
 }
 
 static bool writeTextFile(const char *path, const String &content) {
-    (void)path;
-    (void)content;
-    return false;
+    if (!sdReady) return false;
+
+    File file = SD.open(path, FILE_WRITE);
+    if (!file) return false;
+
+    size_t written = file.print(content);
+    file.close();
+    return written == content.length();
+}
+
+static bool loadState() {
+    String content = readFile(STATE_PATH);
+    if (content.length() == 0) return false;
+
+    int loadedLight = lightHours;
+    int loadedDark = darkHours;
+    int loadedVeg = daysVeg;
+    int loadedFlower = daysFlower;
+    int loadedStage = isVegetative ? 1 : 0;
+    int loadedLightMode = inLightMode ? 1 : 0;
+    double loadedElapsed = photoSecondsElapsed;
+    long long loadedCycleStart = (long long)cycleStartEpoch;
+
+    int parsed = sscanf(
+        content.c_str(),
+        "version=1\nlightHours=%d\ndarkHours=%d\ndaysVeg=%d\ndaysFlower=%d\nisVegetative=%d\ninLightMode=%d\nphotoSecondsElapsed=%lf\ncycleStartEpoch=%lld",
+        &loadedLight,
+        &loadedDark,
+        &loadedVeg,
+        &loadedFlower,
+        &loadedStage,
+        &loadedLightMode,
+        &loadedElapsed,
+        &loadedCycleStart
+    );
+
+    if (parsed != 8) {
+        Serial.println("[SD] estado invalido");
+        return false;
+    }
+
+    lightHours = constrain(loadedLight, 1, 24);
+    darkHours = constrain(loadedDark, 1, 24);
+    daysVeg = max(0, loadedVeg);
+    daysFlower = max(0, loadedFlower);
+    isVegetative = loadedStage != 0;
+
+    double totalSecs = (lightHours + darkHours) * 3600.0;
+    photoSecondsElapsed = constrain(loadedElapsed, 0.0, totalSecs - 0.001);
+    inLightMode = photoSecondsElapsed < lightHours * 3600.0;
+    cycleStartEpoch = (time_t)loadedCycleStart;
+    rtcAnchored = false;
+
+    Serial.println("[SD] estado recuperado");
+    return true;
 }
 
 static bool saveState() {
-    return false;
+    if (!sdReady) return false;
+
+    String content;
+    content.reserve(256);
+    content += "version=1\n";
+    content += "lightHours=" + String(lightHours) + "\n";
+    content += "darkHours=" + String(darkHours) + "\n";
+    content += "daysVeg=" + String(daysVeg) + "\n";
+    content += "daysFlower=" + String(daysFlower) + "\n";
+    content += "isVegetative=" + String(isVegetative ? 1 : 0) + "\n";
+    content += "inLightMode=" + String(inLightMode ? 1 : 0) + "\n";
+    content += "photoSecondsElapsed=" + String(photoSecondsElapsed, 3) + "\n";
+    char epochBuffer[32];
+    snprintf(epochBuffer, sizeof(epochBuffer), "%lld", (long long)cycleStartEpoch);
+    content += "cycleStartEpoch=" + String(epochBuffer) + "\n";
+
+    const char *tempPath = "/estado.tmp";
+    SD.remove(tempPath);
+    if (!writeTextFile(tempPath, content)) return false;
+
+    SD.remove(STATE_PATH);
+    if (!SD.rename(tempPath, STATE_PATH)) {
+        SD.remove(tempPath);
+        return false;
+    }
+
+    stateDirty = false;
+    lastAutoSave = millis();
+    return true;
 }
 
 // ============================================================
@@ -1029,6 +1124,8 @@ static void sendControl() {
 // FOTOPERIODO
 // ============================================================
 
+static void markChanged();
+
 static double getCycleSecondsRTC() {
     if (!rtcAnchored || !rtcReady) {
         return photoSecondsElapsed;
@@ -1056,176 +1153,96 @@ static double getCycleSecondsRTC() {
     return elapsed;
 }
 
+// Los contadores son independientes de la UI: sólo se modifican cuando
+// termina uno o más ciclos completos de LUZ + OSCURIDAD.
+static void addCompletedCycles(unsigned long completedCycles) {
+    if (completedCycles == 0) return;
+
+    if (isVegetative) {
+        daysVeg += completedCycles;
+    } else {
+        daysFlower += completedCycles;
+    }
+
+    markChanged();
+}
+
+static double consumeCompletedCycles(double elapsed, double totalSecs) {
+    if (elapsed < totalSecs) return elapsed;
+
+    unsigned long completedCycles =
+        (unsigned long)(elapsed / totalSecs);
+
+    addCompletedCycles(completedCycles);
+    return elapsed - completedCycles * totalSecs;
+}
+
 static void updatePhotoperiod() {
     static unsigned long lastMillis = 0;
 
     unsigned long nowMs = millis();
-
     if (lastMillis == 0) {
         lastMillis = nowMs;
         return;
     }
 
-    double delta =
-        (nowMs - lastMillis) / 1000.0;
-
+    double delta = (nowMs - lastMillis) / 1000.0;
     lastMillis = nowMs;
 
-    double totalSecs =
-        (lightHours + darkHours) * 3600.0;
+    double totalSecs = (lightHours + darkHours) * 3600.0;
+    double lightSecs = lightHours * 3600.0;
+    if (totalSecs <= 0.0) return;
 
-    double lightSecs =
-        lightHours * 3600.0;
-
-    if (totalSecs <= 0) return;
-
-    // Anclar al RTC.
+    // Ruta 1: sincronización/anclaje con RTC. El epoch guardado representa
+    // el inicio del ciclo actual, por lo que también contabiliza el tiempo
+    // transcurrido con el equipo apagado una sola vez.
     if (rtcReady && !rtcAnchored) {
-
-        time_t epoch =
-            getRtcEpoch();
-
-        if (epoch >= VALID_EPOCH &&
-            !rtcNeedsNtpSync) {
-
-            if (cycleStartEpoch > 0 &&
-                epoch >= cycleStartEpoch) {
-
-                double elapsed =
-                    difftime(
-                        epoch,
-                        cycleStartEpoch
-                    );
-
-                unsigned long completedCycles =
-                    (unsigned long)(
-                        elapsed / totalSecs
-                    );
-
-                if (completedCycles > 0) {
-
-                    cycleStartEpoch +=
-                        (time_t)(
-                            completedCycles *
-                            totalSecs
-                        );
-
-                    if (isVegetative) {
-                        daysVeg += completedCycles;
-                    } else {
-                        daysFlower += completedCycles;
-                    }
-
-                    stateDirty = true;
-                    lastStateChangeMs = millis();
-                }
-
+        time_t epoch = getRtcEpoch();
+        if (epoch >= VALID_EPOCH && !rtcNeedsNtpSync) {
+            if (cycleStartEpoch > 0 && epoch >= cycleStartEpoch) {
+                double elapsed = difftime(epoch, cycleStartEpoch);
+                elapsed = consumeCompletedCycles(elapsed, totalSecs);
+                cycleStartEpoch = epoch - (time_t)elapsed;
+                photoSecondsElapsed = elapsed;
             } else {
-
-                cycleStartEpoch =
-                    epoch -
-                    (time_t)photoSecondsElapsed;
+                cycleStartEpoch = epoch - (time_t)photoSecondsElapsed;
             }
-
             rtcAnchored = true;
         }
     }
 
+    // Ruta 2: avance normal anclado al RTC.
     if (rtcReady && rtcAnchored) {
+        time_t epoch = getRtcEpoch();
+        double elapsed = difftime(epoch, cycleStartEpoch);
+        if (elapsed < 0.0) elapsed = 0.0;
 
-        time_t epoch =
-            getRtcEpoch();
-
-        double elapsed =
-            difftime(
-                epoch,
-                cycleStartEpoch
-            );
-
-        if (elapsed < 0) {
-            elapsed = 0;
-        }
-
-        if (elapsed >= totalSecs) {
-
-            unsigned long completedCycles =
-                (unsigned long)(
-                    elapsed / totalSecs
-                );
-
-            cycleStartEpoch +=
-                (time_t)(
-                    completedCycles *
-                    totalSecs
-                );
-
-            if (isVegetative) {
-                daysVeg += completedCycles;
-            } else {
-                daysFlower += completedCycles;
-            }
-
-            elapsed -=
-                (double)(
-                    completedCycles *
-                    totalSecs
-                );
-
-            stateDirty = true;
-            lastStateChangeMs = millis();
-        }
-
+        elapsed = consumeCompletedCycles(elapsed, totalSecs);
+        cycleStartEpoch = epoch - (time_t)elapsed;
         photoSecondsElapsed = elapsed;
-
     } else {
-
+        // Ruta 3: avance sin RTC. Conserva el resto del ciclo si el bucle se
+        // retrasó, y suma exactamente todos los ciclos completos transcurridos.
         photoSecondsElapsed += delta;
-
-        if (photoSecondsElapsed >= totalSecs) {
-
-            photoSecondsElapsed = 0;
-
-            if (isVegetative) {
-                daysVeg++;
-            } else {
-                daysFlower++;
-            }
-
-            stateDirty = true;
-            lastStateChangeMs = millis();
-        }
+        photoSecondsElapsed =
+            consumeCompletedCycles(photoSecondsElapsed, totalSecs);
     }
 
-    bool newLight =
-        photoSecondsElapsed < lightSecs;
-
+    bool newLight = photoSecondsElapsed < lightSecs;
     if (newLight != inLightMode) {
-
         inLightMode = newLight;
-
-        // El relay de luz está físicamente en el ESP32 principal.
         relay1Command = inLightMode;
-
         sendControl();
     }
 
-    // El principal conserva el control físico de relay1.
     relay1Command = inLightMode;
 
-    // Historial cada hora.
     if (nowMs - lastHistoryUpdate > 3600000UL) {
-
         for (int i = 0; i < 23; i++) {
             history24[i] = history24[i + 1];
         }
-
-        history24[23] =
-            (photoSecondsElapsed /
-             totalSecs) *
-            100.0f;
-
+        history24[23] = (photoSecondsElapsed / totalSecs) * 100.0f;
         lastHistoryUpdate = nowMs;
-
         historyDirty = true;
     }
 }
@@ -1496,6 +1513,15 @@ static void markChanged() {
     lastStateChangeMs = millis();
 }
 
+static void preserveCycleProgressAfterScheduleChange() {
+    double totalSecs = (lightHours + darkHours) * 3600.0;
+    photoSecondsElapsed = constrain(photoSecondsElapsed, 0.0, totalSecs - 0.001);
+
+    if (rtcAnchored) {
+        cycleStartEpoch = getRtcEpoch() - (time_t)photoSecondsElapsed;
+    }
+}
+
 static void onLightMinus(
     lv_event_t *e
 ) {
@@ -1507,12 +1533,7 @@ static void onLightMinus(
             lightHours - 1
         );
 
-    if (rtcAnchored) {
-        cycleStartEpoch =
-            getRtcEpoch() -
-            (time_t)photoSecondsElapsed;
-    }
-
+    preserveCycleProgressAfterScheduleChange();
     markChanged();
 }
 
@@ -1527,6 +1548,7 @@ static void onLightPlus(
             lightHours + 1
         );
 
+    preserveCycleProgressAfterScheduleChange();
     markChanged();
 }
 
@@ -1541,6 +1563,7 @@ static void onDarkMinus(
             darkHours - 1
         );
 
+    preserveCycleProgressAfterScheduleChange();
     markChanged();
 }
 
@@ -1555,6 +1578,7 @@ static void onDarkPlus(
             darkHours + 1
         );
 
+    preserveCycleProgressAfterScheduleChange();
     markChanged();
 }
 
@@ -1609,10 +1633,20 @@ static void onStage(
 ) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 
+    // Una etapa nueva comienza un ciclo nuevo; los contadores acumulados
+    // permanecen intactos y el ciclo incompleto anterior no se atribuye a
+    // la etapa recién seleccionada.
     isVegetative = !isVegetative;
+    photoSecondsElapsed = 0.0;
+    inLightMode = true;
 
+    if (rtcAnchored) {
+        cycleStartEpoch = getRtcEpoch();
+    }
+
+    relay1Command = true;
+    sendControl();
     updateFace();
-
     markChanged();
 }
 
@@ -2235,9 +2269,11 @@ void setup() {
     rtcNeedsNtpSync = false;
 
     // --------------------------------------------------------
-    // SD desactivada durante esta prueba
+    // SD: recupera contadores y ancla de ciclo antes de crear la UI.
     // --------------------------------------------------------
-    sdReady = false;
+    if (initSdCard()) {
+        loadState();
+    }
 
     // --------------------------------------------------------
     // WiFi/ESP-NOW:
@@ -2277,15 +2313,9 @@ void setup() {
 
     lvgl_port_unlock();
 
-    // Estado inicial para la demostración.
-    lightHours = 12;
-    darkHours = 12;
-    daysVeg = 0;
-    daysFlower = 0;
-    isVegetative = true;
-    inLightMode = true;
-
-    relay1Command = false;
+    // Los valores por defecto ya están en las variables globales. Si la SD
+    // tenía un estado válido, loadState() los conservó.
+    relay1Command = inLightMode;
     relay2Command = false;
     humidifierCommand = false;
 
@@ -2320,6 +2350,14 @@ void loop() {
 
         lvgl_port_unlock();
         lastUI = millis();
+    }
+
+    if (stateDirty &&
+        millis() - lastStateChangeMs >= SAVE_AFTER_TOUCH_RELEASE_MS) {
+        if (!saveState()) {
+            // Se reintentará en el siguiente ciclo; no se pierde el estado sucio.
+            lastStateChangeMs = millis() - SAVE_AFTER_TOUCH_RELEASE_MS + SD_SAVE_RETRY_MS;
+        }
     }
 
     delay(2);
